@@ -185,6 +185,10 @@ fun ArkhamLiveScreen() {
         )
     }
 
+    val nextUncheckedIndex = remember(entriesToShow) {
+        entriesToShow.indexOfFirst { !it.checked }
+    }
+
     val prisonersToShow = remember(state.remainingPrisoners) {
         normalizePrisoners(state.remainingPrisoners)
     }
@@ -193,7 +197,7 @@ fun ArkhamLiveScreen() {
     var previousCheckedIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var hasInitializedEntries by remember { mutableStateOf(false) }
 
-    LaunchedEffect(entriesToShow) {
+    LaunchedEffect(entriesToShow, nextUncheckedIndex) {
         val currentCheckedIds = entriesToShow.filter { it.checked }.map { it.id }.toSet()
         if (!hasInitializedEntries) {
             previousCheckedIds = currentCheckedIds
@@ -202,12 +206,8 @@ fun ArkhamLiveScreen() {
         }
 
         val newlyCheckedIds = currentCheckedIds - previousCheckedIds
-        if (newlyCheckedIds.isNotEmpty() && entriesToShow.isNotEmpty()) {
-            val targetIndex = entriesToShow
-                .indexOfFirst { it.id in newlyCheckedIds }
-                .coerceAtLeast(0)
-            val scrollIndex = (targetIndex + 1).coerceAtMost(entriesToShow.lastIndex)
-            entriesListState.animateScrollToItem(scrollIndex)
+        if (newlyCheckedIds.isNotEmpty() && nextUncheckedIndex != -1) {
+            entriesListState.animateScrollToItem(nextUncheckedIndex)
         }
         previousCheckedIds = currentCheckedIds
     }
