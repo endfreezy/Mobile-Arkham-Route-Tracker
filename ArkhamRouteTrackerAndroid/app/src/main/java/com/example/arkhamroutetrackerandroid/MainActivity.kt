@@ -1,8 +1,15 @@
 package com.example.arkhamroutetrackerandroid
 
 import android.app.Activity
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -62,14 +69,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
-private const val GITHUB_URL = "https://github.com/ShikenNuggets"
+private const val GITHUB_URL = "https://github.com/endfreezy/Mobile-Arkham-Route-Tracker"
+private const val GITHUB_OWNER = "endfreezy"
+private const val GITHUB_REPO = "Mobile-Arkham-Route-Tracker"
+
 private const val PREFS_NAME = "arkham_tracker_prefs"
 private const val KEY_SAVED_HOST = "saved_host_ip_port"
 private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
@@ -90,10 +103,18 @@ data class LiveTrackerUiState(
     val errorMessage: String? = null
 )
 
+data class ReleaseUpdateInfo(
+    val tagName: String,
+    val notes: String,
+    val apkUrl: String,
+    val htmlUrl: String
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        window.decorView.setBackgroundColor(android.graphics.Color.parseColor("#14161A"))
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 ArkhamLiveScreen()
@@ -118,6 +139,168 @@ private fun buildStateUrl(rawHost: String): String {
     return "http://$cleaned/state"
 }
 
+private fun getCurrentAppVersionName(context: Context): String {
+    return try {
+        val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+        pkgInfo.versionName ?: "1.0.0"
+    } catch (_: Exception) {
+        "1.0.0"
+    }
+}
+
+private fun parseVersionParts(raw: String): List<Int> {
+    val clean = raw.trim().removePrefix("v").removePrefix("V").substringBefore("-")
+    return clean.split(".").map { part ->
+        part.filter { it.isDigit() }.toIntOrNull() ?: 0
+    }
+}
+
+private fun isRemoteVersionNewer(remoteTag: String, currentVersion: String): Boolean {
+    val remote = parseVersionParts(remoteTag)
+    val current = parseVersionParts(currentVersion)
+    val maxLen = maxOf(remote.size, current.size)
+    for (i in 0 until maxLen) {
+        val r = remote.getOrElse(i) { 0 }
+        val c = current.getOrElse(i) { 0 }
+        if (r > c) return true
+        if (r < c) return false
+    }
+    return false
+}
+
+private suspend fun checkLatestGitHubRelease(currentVersion: String): ReleaseUpdateInfo? =
+    withContext(Dispatchers.IO) {
+        try {
+            val apiUrl = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
+            val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                setRequestProperty("Accept", "application/vnd.github+json")
+                setRequestProperty("User-Agent", "ArkhamTracker-Android")
+                connectTimeout = 4000
+                readTimeout = 4000
+            }
+            val code = conn.responseCode
+            val body = if (code in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                ""
+            }
+            conn.disconnect()
+
+            if (code !in 200..299 || body.isBlank()) return@withContext null
+
+            val json = JSONObject(body)
+            val tagName = json.optString("tag_name", "").trim()
+            val htmlUrl = json.optString("html_url", "").trim()
+            val notes = json.optString("body", "").trim()
+
+            if (tagName.isBlank() || !isRemoteVersionNewer(tagName, currentVersion)) {
+                return@withContext null
+            }
+
+            var apkUrl = ""
+            val assets = json.optJSONArray("assets")
+            if (assets != null) {
+                for (i in 0 until assets.length()) {
+                    val asset = assets.optJSONObject(i) ?: continue
+                    val name = asset.optString("name", "")
+                    val downloadUrl = asset.optString("browser_download_url", "")
+                    if (name.endsWith(".apk", ignoreCase = true) && downloadUrl.isNotBlank()) {
+                        apkUrl = downloadUrl
+                        break
+                    }
+                }
+            }
+
+            ReleaseUpdateInfo(
+                tagName = tagName,
+                notes = notes,
+                apkUrl = apkUrl,
+                htmlUrl = htmlUrl
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+private fun installApkFile(context: Context, apkFile: File) {
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        apkFile
+    )
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
+}
+
+private fun startApkDownload(
+    context: Context,
+    apkUrl: String,
+    fileName: String,
+    onStatusChange: (String) -> Unit
+) {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !context.packageManager.canRequestPackageInstalls()
+        ) {
+            onStatusChange("Enable 'Install unknown apps' permission, then tap Update again.")
+            val settingsIntent = Intent(
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${context.packageName}")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(settingsIntent)
+            return
+        }
+
+        val downloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        val targetFile = File(downloadsDir, fileName)
+        if (targetFile.exists()) {
+            targetFile.delete()
+        }
+
+        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val request = DownloadManager.Request(Uri.parse(apkUrl))
+            .setTitle("ArkhamTracker $fileName")
+            .setDescription("Downloading update...")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+            .setDestinationUri(Uri.fromFile(targetFile))
+
+        val downloadId = downloadManager.enqueue(request)
+        onStatusChange("Downloading update...")
+
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                val receivedId = intent?.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L) ?: -1L
+                if (receivedId == downloadId) {
+                    try {
+                        ctx?.unregisterReceiver(this)
+                    } catch (_: Exception) {
+                    }
+                    if (targetFile.exists()) {
+                        onStatusChange("Opening installer...")
+                        installApkFile(context, targetFile)
+                    } else {
+                        onStatusChange("Downloaded file not found.")
+                    }
+                }
+            }
+        }
+
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    } catch (e: Exception) {
+        onStatusChange("Download failed: ${e.message ?: "error"}")
+    }
+}
+
 @Composable
 private fun KeepScreenOnEffect(enabled: Boolean) {
     val context = LocalContext.current
@@ -136,6 +319,7 @@ private fun KeepScreenOnEffect(enabled: Boolean) {
 fun ArkhamLiveScreen() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+    val currentVersion = remember { getCurrentAppVersionName(context) }
 
     val initialHost = remember {
         prefs.getString(KEY_SAVED_HOST, "192.168.1.50:8765") ?: "192.168.1.50:8765"
@@ -150,6 +334,8 @@ fun ArkhamLiveScreen() {
     var keepScreenOn by remember { mutableStateOf(initialKeepScreenOn) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
+    var updateInfo by remember { mutableStateOf<ReleaseUpdateInfo?>(null) }
+    var updateStatusText by remember { mutableStateOf<String?>(null) }
     var state by remember { mutableStateOf(LiveTrackerUiState()) }
 
     fun saveAndApplyHost() {
@@ -170,6 +356,13 @@ fun ArkhamLiveScreen() {
     val uriHandler = LocalUriHandler.current
     val clipboardManager = LocalClipboardManager.current
     var linkStatusMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        val found = checkLatestGitHubRelease(currentVersion)
+        if (found != null) {
+            updateInfo = found
+        }
+    }
 
     LaunchedEffect(isConnected, activeUrl) {
         while (isConnected) {
@@ -210,6 +403,77 @@ fun ArkhamLiveScreen() {
             entriesListState.animateScrollToItem(nextUncheckedIndex)
         }
         previousCheckedIds = currentCheckedIds
+    }
+
+    if (updateInfo != null) {
+        val info = updateInfo!!
+        AlertDialog(
+            onDismissRequest = {
+                updateInfo = null
+                updateStatusText = null
+            },
+            title = {
+                Text(
+                    text = "Update Available (${info.tagName})",
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "Current version: $currentVersion",
+                        color = Color(0xFFB8C0CC),
+                        fontSize = 12.sp
+                    )
+                    if (info.notes.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = info.notes.take(300),
+                            color = Color.White,
+                            fontSize = 13.sp
+                        )
+                    }
+                    if (updateStatusText != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = updateStatusText!!,
+                            color = Color(0xFF58A6FF),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (info.apkUrl.isNotBlank()) {
+                            startApkDownload(
+                                context = context,
+                                apkUrl = info.apkUrl,
+                                fileName = "ArkhamTracker-${info.tagName}.apk",
+                                onStatusChange = { updateStatusText = it }
+                            )
+                        } else if (info.htmlUrl.isNotBlank()) {
+                            uriHandler.openUri(info.htmlUrl)
+                        }
+                    }
+                ) {
+                    Text(if (info.apkUrl.isNotBlank()) "Update" else "Open Release")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        updateInfo = null
+                        updateStatusText = null
+                    }
+                ) {
+                    Text("Later")
+                }
+            },
+            containerColor = Color(0xFF1E2229)
+        )
     }
 
     if (showSettingsDialog) {
